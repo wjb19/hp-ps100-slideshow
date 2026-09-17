@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Large scanner dumps / local previews (keep code + YuNet model)
+*.raw
+*.pgm
+*.ppm
+*.pcapng
+_grid_tune.py
+*.jpg
+!data/**
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
