@@ -116,15 +116,33 @@ def prepare_scan(bot: Bot) -> None:
 
 def stop_scan(bot: Bot) -> None:
     c5_out(bot, "stop", bytes.fromhex("17000000000000000000"))
+    # Drop a stale ready latch when possible so the next prepare_scan is not
+    # immediately treated as "buffer already ready".
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        ready, _offset, _raw = read_progress(bot)
+        if not ready:
+            break
+        c5_out(bot, "keepalive", KEEPALIVE_OUT, timeout=500, quiet=True)
+        time.sleep(0.05)
 
 
-def read_progress(bot: Bot) -> tuple[bool, int | None, bytes | None]:
-    """Read channel-2 24-byte progress. ready when LE dword0 == 1."""
-    # Light preamble like WorkScan immediately before the progress pair.
-    for sub in (0x04, 0x06, 0x04, 0x03, 0x03, 0x05):
-        c5_in(bot, f"poll ff/{sub:02x}", 16, 0xFF, sub, timeout=500, quiet=True)
-    c5_in(bot, "progress ch1", 24, 0x02, 0x01, timeout=500, quiet=True)
-    c5_in(bot, "poll ff/04", 16, 0xFF, 0x04, timeout=500, quiet=True)
+def read_progress(
+    bot: Bot,
+    full: bool = True,
+) -> tuple[bool, int | None, bytes | None]:
+    """Read channel-2 24-byte progress. ready when LE dword0 == 1.
+
+    full=True matches the WorkScan preamble (used before the first read and
+    when validating a fresh page). full=False is a single status IN — enough
+    for inter-burst sync and much cheaper (one URB instead of ~9).
+    """
+    if full:
+        # Light preamble like WorkScan immediately before the progress pair.
+        for sub in (0x04, 0x06, 0x04, 0x03, 0x03, 0x05):
+            c5_in(bot, f"poll ff/{sub:02x}", 16, 0xFF, sub, timeout=500, quiet=True)
+        c5_in(bot, "progress ch1", 24, 0x02, 0x01, timeout=500, quiet=True)
+        c5_in(bot, "poll ff/04", 16, 0xFF, 0x04, timeout=500, quiet=True)
     data, _status = c5_in(bot, "progress ch2", 24, 0x02, 0x02, timeout=500, quiet=True)
     if not data or len(data) < 24:
         return False, None, data
@@ -133,23 +151,56 @@ def read_progress(bot: Bot) -> tuple[bool, int | None, bytes | None]:
     return ready, offset if offset else None, data
 
 
-def wait_for_buffer(bot: Bot, fallback: int, timeout: float = 3.0) -> int:
+def wait_for_buffer(
+    bot: Bot,
+    fallback: int,
+    timeout: float = 3.0,
+    min_wait: float = 0.0,
+    prior_progress: bytes | None = None,
+    require_fresh: bool = False,
+    full_progress: bool = True,
+    poll_sleep: float = 0.03,
+) -> int:
     """Poll briefly for a ready buffer; fall back to the computed offset.
 
     WorkScan only needed ~0.5s here. A hard wait on the ready bit can spin
     forever if that dword never flips on Linux, so we always bound the wait.
+
+    After prepare_scan, pass require_fresh=True with a pre-start progress
+    snapshot. That rejects a stale ready latch from the previous page (which
+    otherwise re-saves the same raw on every batch iteration).
+
+    Inter-burst sync should use full_progress=False and a short timeout — the
+    sequential C3 offset is already a good fallback.
     """
-    deadline = time.time() + timeout
+    t0 = time.time()
+    deadline = t0 + timeout
     last = None
+    saw_busy = False
+    changed = prior_progress is None
     while time.time() < deadline:
-        ready, offset, raw = read_progress(bot)
+        ready, offset, raw = read_progress(bot, full=full_progress)
         last = (ready, offset, raw)
-        if ready and offset is not None:
-            if bot.verbose:
-                print(f"  buffer ready offset={offset:#x}")
-            return offset
-        c5_out(bot, "keepalive", KEEPALIVE_OUT, timeout=500, quiet=True)
-        time.sleep(0.03)
+        if prior_progress is not None and raw is not None and raw != prior_progress:
+            changed = True
+        if not ready:
+            saw_busy = True
+        elapsed = time.time() - t0
+        if ready and offset is not None and elapsed >= min_wait:
+            fresh_ok = (not require_fresh) or saw_busy or changed or prior_progress is None
+            if fresh_ok:
+                if bot.verbose:
+                    print(f"  buffer ready offset={offset:#x} after {elapsed:.1f}s")
+                return offset
+        if full_progress:
+            c5_out(bot, "keepalive", KEEPALIVE_OUT, timeout=500, quiet=True)
+        if poll_sleep > 0:
+            time.sleep(poll_sleep)
+    if require_fresh and prior_progress is not None and not (saw_busy or changed):
+        raise RuntimeError(
+            "scan buffer did not refresh after start — "
+            "load a new photo in the feeder and try again"
+        )
     if bot.verbose and last is not None:
         ready, offset, raw = last
         print(
@@ -165,6 +216,7 @@ def read_image(
     total_bytes: int = EXPECTED_IMAGE_BYTES,
     start_offset: int | None = None,
     chunk_sizes: list[int] | None = None,
+    prior_progress: bytes | None = None,
 ) -> bytes:
     """Read the scan buffer with 0xC3 in WorkScan burst/poll cadence."""
     sizes = list(chunk_sizes) if chunk_sizes is not None else capture_chunk_sizes()
@@ -177,8 +229,18 @@ def read_image(
             rem -= n
 
     if start_offset is None:
-        print("waiting for scan buffer (max 3s)...")
-        offset = wait_for_buffer(bot, fallback=DEFAULT_START_OFFSET, timeout=3.0)
+        # Paper feed + digitize needs several seconds; also reject a stale
+        # ready bit left from the previous page.
+        print("waiting for scan buffer...")
+        offset = wait_for_buffer(
+            bot,
+            fallback=DEFAULT_START_OFFSET,
+            timeout=45.0,
+            min_wait=4.0,
+            prior_progress=prior_progress,
+            require_fresh=prior_progress is not None,
+            full_progress=True,
+        )
     else:
         offset = start_offset
 
@@ -198,7 +260,12 @@ def read_image(
             bot.clear(0x81)
             bot.clear(0x02)
             # One recovery attempt after a short buffer wait.
-            offset = wait_for_buffer(bot, fallback=offset, timeout=2.0)
+            offset = wait_for_buffer(
+                bot,
+                fallback=offset,
+                timeout=2.0,
+                full_progress=True,
+            )
             cdb = c3_cdb(offset, n)
             data, status = bot.command(
                 f"image-retry @ {offset:#x} +{n}",
@@ -216,15 +283,55 @@ def read_image(
                 )
         parts.append(data)
         done += len(data)
-        offset = (offset + n) & 0xFFFFFFFF
+        next_off = (offset + n) & 0xFFFFFFFF
         if bot.verbose:
-            print(f"  got {len(data)}/{n} next_off={offset:#x} total={done}")
+            print(f"  got {len(data)}/{n} next_off={next_off:#x} total={done}")
 
-        # After each short (end of a 10-chunk burst), briefly sync progress.
+        # Reject sparse/garbage URBs (seen when inter-burst sync falls back too
+        # early) and retry once after a full progress wait.
+        if len(data) == n and n >= 32256:
+            uniq = len(set(data[:: max(1, n // 4096)]))
+            # Full-chunk subsample: also check raw unique on a window.
+            window = data[: min(n, 8192)]
+            uniq_w = len(set(window))
+            if uniq_w <= 8 and done > 65536:
+                if bot.verbose:
+                    print(f"  suspicious chunk uniq={uniq_w}; re-sync and retry")
+                bot.clear(0x81)
+                bot.clear(0x02)
+                offset = wait_for_buffer(
+                    bot, fallback=offset, timeout=2.0, full_progress=True, poll_sleep=0.02
+                )
+                cdb = c3_cdb(offset, n)
+                data2, status2 = bot.command(
+                    f"image-resync @ {offset:#x} +{n}",
+                    cdb,
+                    data_len=n,
+                    direction="in",
+                    timeout=15000,
+                )
+                if data2 and status2 in (0, None) and len(set(data2[: min(n, 8192)])) > 8:
+                    parts[-1] = data2
+                    next_off = (offset + n) & 0xFFFFFFFF
+
+        offset = next_off
+
+        # After each short (end of a 10-chunk burst), sync progress. Use the
+        # full WorkScan preamble — a too-aggressive fast fallback was reading
+        # unfilled buffer tail (rainbow garbage in later rows).
         if n == 32256 and i + 1 < len(sizes):
             bursts += 1
-            print(f"burst {bursts}/24 — {done}/{EXPECTED_IMAGE_BYTES} bytes")
-            offset = wait_for_buffer(bot, fallback=offset, timeout=2.0)
+            if bot.verbose:
+                print(f"burst {bursts}/24 — {done}/{EXPECTED_IMAGE_BYTES} bytes")
+            elif bursts == 1 or bursts % 6 == 0 or bursts == 24:
+                print(f"burst {bursts}/24 — {done}/{EXPECTED_IMAGE_BYTES} bytes")
+            offset = wait_for_buffer(
+                bot,
+                fallback=offset,
+                timeout=2.0,
+                full_progress=True,
+                poll_sleep=0.02,
+            )
 
     return b"".join(parts)
 
@@ -378,13 +485,14 @@ def estimate_yscale(
     width: int = PARAM_WIDTH,
     lo: float = 0.45,
     hi: float = 1.05,
-    steps: int = 25,
+    steps: int = 31,
 ) -> tuple[float, dict]:
     """Estimate Y display scale so square pixels look correct.
 
-    Searches y_scale in [lo, hi], scoring each candidate by gradient isotropy on
-    the content crop (primary) plus a weak circular-feature bonus. Returns
-    (best_scale, diagnostics).
+    Searches y_scale in [lo, hi], ranking primarily by gradient isotropy on the
+    content crop. Near-tied valleys (common on textured prints) are broken with
+    only a weak default pull / circle bonus so a slightly worse low scale cannot
+    beat a better higher scale — that previously squashed portraits vertically.
     """
     _w, raw_h, green = extract_channel(raw, channel=1, width=width)
     box = content_bbox(green, width, raw_h)
@@ -392,31 +500,52 @@ def estimate_yscale(
     if cw < 16 or ch < 16:
         return PARAM_DISPLAY_Y_SCALE, {"reason": "no-content", "bbox": box}
 
-    best_s = PARAM_DISPLAY_Y_SCALE
-    best_score = -1e9
-    ranked: list[tuple[float, float, float, float]] = []
+    samples: list[tuple[float, float, float]] = []  # aniso, scale, circ
     for i in range(steps):
         s = lo + (hi - lo) * i / max(1, steps - 1)
         _hh, scaled = _rescale_y_gray(crop, cw, ch, s)
         aniso = _gradient_anisotropy(scaled, cw, _hh)
         circ = _circle_score(scaled, cw, _hh)
-        # Lower anisotropy is better; circular features break ties.
-        score = -aniso + 0.05 * circ
-        ranked.append((score, s, aniso, circ))
-        if score > best_score:
-            best_score = score
-            best_s = s
+        samples.append((aniso, s, circ))
 
-    ranked.sort(reverse=True)
+    best_aniso = min(a for a, _s, _c in samples)
+    # Absolute + relative slack: keep every near-isotropic valley in play.
+    aniso_slack = max(0.01, 0.35 * best_aniso + 1e-4)
+    near = [(a, s, c) for a, s, c in samples if a <= best_aniso + aniso_slack]
+    if not near:
+        near = samples
+
+    def tie_score(aniso: float, s: float, circ: float) -> float:
+        # Anisotropy still dominates inside the near set; default pull is ~10×
+        # weaker than before so a 0.95 valley can beat a 0.80 neighbor.
+        # Tiny bias toward mid/high scales avoids chronic vertical squash.
+        return (
+            -aniso
+            + 1e-4 * circ
+            - 0.0015 * abs(s - PARAM_DISPLAY_Y_SCALE)
+            + 0.0005 * s
+        )
+
+    ranked = sorted(
+        ((tie_score(a, s, c), s, a, c) for a, s, c in near),
+        reverse=True,
+    )
+    best_score, best_s, _ba, _bc = ranked[0]
+
     # Snap to a few friendly values when very close.
-    for snap in (0.5, 2 / 3, 0.75, 0.8, 0.85, 1.0):
-        if abs(best_s - snap) <= (hi - lo) / steps:
+    step = (hi - lo) / max(1, steps - 1)
+    for snap in (0.5, 2 / 3, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0):
+        if abs(best_s - snap) <= step:
             best_s = snap
             break
 
+    # Full ranking for diagnostics (by tie score over the near set).
     return round(best_s, 4), {
         "bbox": box,
         "content": (cw, ch),
+        "best_aniso": round(best_aniso, 4),
+        "aniso_slack": round(aniso_slack, 4),
+        "near": len(near),
         "top": [(round(s, 4), round(an, 4), round(c, 3)) for _, s, an, c in ranked[:5]],
         "score": round(best_score, 4),
     }

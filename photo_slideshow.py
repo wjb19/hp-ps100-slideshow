@@ -8,8 +8,9 @@ a slideshow player can advance without layout jumps.
 With --crop-to-portal (or --fit cover), cropping prefers keeping as many faces
 in frame as possible when OpenCV + the bundled YuNet model are available.
 If no faces are found, salient subjects (boats, buildings, etc.) are used instead.
-If an old-fashioned white print border is detected, aspect cropping is skipped
-and the print is upscaled to fit the portal while keeping its native aspect ratio.
+With --old-photos (keep-border on), portal aspect-crop is never applied — the
+full print is upscaled and centered (letterbox/pillarbox) so wrong ARs stay intact.
+Pass --no-keep-border and/or --crop-to-portal to allow face-aware crop-to-portal.
 Small prints are enlarged with stepwise Lanczos interpolation plus a light unsharp.
 By default frames are rendered at 2× portal density (e.g. 3840×2160 for 1080p) so
 a slideshow can zoom in without immediately running out of pixels.
@@ -23,14 +24,17 @@ Other examples:
   python3 photo_slideshow.py --from-raw /tmp/ps100.raw --out /tmp/album --old-photos
   sudo python3 photo_slideshow.py --out ~/Pictures/album --portal 1920x1080 --crop-to-portal
 
-Keys during interactive scanning: Enter = scan next, q = quit.
+Keys while scanning: Enter = scan next, q = quit. --count N stops after N photos.
+JPG processing runs in a background thread so the next scan can start immediately.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -62,6 +66,7 @@ from protocol import (
     ping,
     prepare_scan,
     read_image,
+    read_progress,
     resolve_yscale,
     stop_scan,
     stretch_contrast,
@@ -71,7 +76,7 @@ from protocol import (
 DEFAULT_PORTAL = (1920, 1080)
 # Soft charcoal matte — neutral for B&W and color prints without harsh black bars.
 DEFAULT_MATTE = (28, 26, 24)
-DEFAULT_DESKEW_LIMIT = 4.0
+DEFAULT_DESKEW_LIMIT = 6.0
 # Render above display portal so slideshow zoom still has pixels to spare.
 DEFAULT_DENSITY = 2.0
 # Soften scanner/paper grid lines (Radon + spatial morph). Opt-in via --smooth-grid only.
@@ -82,7 +87,7 @@ OLD_PHOTO_PRESET = {
     "portal": "1920x1080",
     "matte": "28,26,24",
     "fit": "contain",
-    "crop_to_portal": True,
+    "crop_to_portal": False,
     "crop_threshold": 0.03,
     "enhance": 1.15,
     "rotate": "auto",
@@ -135,6 +140,83 @@ def raw_to_rgb_image(raw: bytes, width: int = PARAM_WIDTH, y_scale: float | str 
     w, h, rgb = decode_rowsbs_rgb(raw, width=width, y_scale=y_scale)
     rgb = stretch_contrast(rgb)
     return Image.frombytes("RGB", (w, h), rgb)
+
+
+# Upright frontal faces are typically ~1.25–1.35 tall/wide. Auto yscale from
+# gradient isotropy sometimes picks a valley that squashes people vertically.
+_TARGET_FACE_HW = 1.30
+
+
+def refine_yscale_with_faces(raw: bytes, base: float, width: int = PARAM_WIDTH) -> float:
+    """Nudge auto y_scale using face box proportions when YuNet is available.
+
+    Gradient isotropy sometimes lands on a valley that squashes people; upright
+    faces should land near ~1.3 tall/wide. Keeps the search small so batch scans
+    stay interactive.
+    """
+    if not _HAS_CV2 or base <= 0:
+        return base
+
+    def face_hw(scale: float) -> tuple[float, int]:
+        img = raw_to_rgb_image(raw, width=width, y_scale=scale)
+        # Trim scanner bed so a small print's face isn't lost after downscale.
+        g = np.asarray(img.convert("L"))
+        on = g > 22
+        ys, xs = np.where(on)
+        if xs.size >= 64:
+            img = img.crop((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
+        w, h = img.size
+        m = max(w, h)
+        if m > 640:
+            r = 640 / m
+            img = img.resize((max(1, int(w * r)), max(1, int(h * r))), Image.Resampling.BILINEAR)
+        faces = detect_faces(img)
+        if not faces:
+            return 0.0, 0
+        ratios = [fh / max(1, fw) for _x, _y, fw, fh in faces if fh >= fw * 0.85]
+        if not ratios:
+            ratios = [fh / max(1, fw) for _x, _y, fw, fh in faces]
+        return float(np.mean(ratios)), len(ratios)
+
+    r0, n0 = face_hw(base)
+    # Already in a natural range — keep the anisotropy pick.
+    # Low auto scales can still look squashed even when face AR is soft-OK.
+    if n0 >= 1 and 1.20 <= r0 <= 1.42 and base >= 0.85:
+        return base
+
+    # Squashed (or no face at a low base) → try taller; stretched → shorter.
+    if n0 >= 1 and r0 > _TARGET_FACE_HW and base >= 0.85:
+        cands = [s for s in (0.75, 0.80, 0.85, 0.90) if s < base - 0.03]
+    else:
+        cands = [s for s in (0.85, 0.90, 0.95, 1.00, 1.05, 1.10) if s > base + 0.03]
+        # Low anisotropy valleys often squash portraits — always probe taller.
+        if base < 0.85:
+            cands = [0.90, 0.95, 1.00, 1.05, 1.10]
+    if not cands:
+        return base
+
+    best_s = base
+    best_err = abs(r0 - _TARGET_FACE_HW) if n0 >= 1 else 9.0
+    found = n0 >= 1
+    for s in cands:
+        r, n = face_hw(s)
+        if n < 1:
+            continue
+        found = True
+        err = abs(r - _TARGET_FACE_HW) + 0.01 * abs(s - base)
+        if err < best_err:
+            best_err = err
+            best_s = s
+    if not found:
+        # No YuNet hits (profile/infant shots): still un-squash chronic low valleys.
+        if base < 0.85:
+            bumped = 1.0
+            print(f"yscale no-face bump {base} → {bumped}")
+            return bumped
+        return base
+    if abs(best_s - base) >= 0.04:
+        print(f"yscale face-refine {base} → {best_s} (face h/w toward {_TARGET_FACE_HW})")
+    return best_s
 
 
 def _longest_run(mask_1d: np.ndarray) -> tuple[int, int]:
@@ -232,9 +314,8 @@ def dense_content_bbox(
                 continue
             if bw * bh > 0.92 * w * h and frac < 0.15:
                 continue
-            # Prefer denser, then prefer compact (small prints over bed+noise).
-            compactness = 1.0 / (1.0 + (bw * bh) / max(1.0, 0.15 * w * h))
-            score = frac * 1e9 + compactness * 1e6 + bw * bh
+            # Prefer denser runs, then larger area (full print over tiny bright islands).
+            score = frac * 1e9 + bw * bh
             box = (cx0, cy0, cx1, cy1)
             if best is None or score > best[0]:
                 best = (score, box)
@@ -321,6 +402,150 @@ def trim_scanner_bed(
     )
 
 
+def mean_content_bbox(
+    gray: np.ndarray,
+    row_thr: float = 22.0,
+    col_thr: float = 22.0,
+    pad: int = 8,
+    rgb: np.ndarray | None = None,
+) -> tuple[int, int, int, int]:
+    """BBox of the photo mount from row/col profiles.
+
+    Profiles rows inside the print's column span (not full bed width) so a small
+    print's cream border isn't dropped when full-width means fall below thr.
+    Rainbow/garbage scan rows are excluded when rgb is provided.
+    """
+    h, w = gray.shape
+    if h < 8 or w < 8:
+        return 0, 0, w, h
+
+    work = gray.astype(np.float32, copy=True)
+    garbage = np.zeros(h, dtype=bool)
+    garbage_frac = 0.0
+
+    if rgb is not None and rgb.shape[:2] == gray.shape:
+        chroma = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+        row_chroma = chroma.mean(axis=1)
+        row_uniq = np.array(
+            [len(np.unique(gray[y, :: max(1, w // 256)])) for y in range(h)],
+            dtype=np.int32,
+        )
+        garbage = (row_chroma > 80.0) | ((row_chroma > 45.0) & (row_uniq <= 12))
+        garbage_frac = float(garbage.mean())
+        work[garbage] = 0
+
+    good = ~garbage
+    if int(good.sum()) < 8:
+        return 0, 0, w, h
+
+    # Column span of the print (bed averages near 0 after zeroing garbage).
+    col_mean = work[good].mean(axis=0)
+    col_ok = col_mean >= col_thr
+    if rgb is not None and rgb.shape[:2] == gray.shape:
+        # Prefer low-chroma columns when a corrupt tail was present.
+        if garbage_frac >= 0.05:
+            col_chroma = (
+                rgb[good].max(axis=2).astype(np.int16) - rgb[good].min(axis=2).astype(np.int16)
+            ).mean(axis=0)
+            col_ok = col_ok & (col_chroma < 40.0)
+    cols = np.where(col_ok)[0]
+    if cols.size < 8:
+        return 0, 0, w, h
+    x0c, x1c = int(cols[0]), int(cols[-1]) + 1
+
+    band = work[:, x0c:x1c]
+    row_mean = band.mean(axis=1)
+    row_frac = (band >= row_thr).mean(axis=1)
+    row_ok = (row_mean >= row_thr) & (row_frac >= 0.12) & ~garbage
+
+    rows = np.where(row_ok)[0]
+    if rows.size < 8:
+        return 0, 0, w, h
+
+    if garbage_frac >= 0.05:
+        # Corrupt tail: largest near-contiguous island above the rainbow.
+        y0, y1 = _largest_merged_run(rows, max_gap=max(8, int(0.03 * h)))
+        if y1 - y0 < 8:
+            y0, y1 = int(rows[0]), int(rows[-1]) + 1
+    else:
+        # Clean scan: keep the full mount (cream borders + dark mid bands).
+        y0, y1 = int(rows[0]), int(rows[-1]) + 1
+
+    # Refine X on the kept Y band.
+    band_y = work[y0:y1]
+    col_ok = band_y.mean(axis=0) >= col_thr
+    if rgb is not None and rgb.shape[:2] == gray.shape:
+        chroma_band = (
+            rgb[y0:y1].max(axis=2).astype(np.int16) - rgb[y0:y1].min(axis=2).astype(np.int16)
+        )
+        col_chroma = chroma_band.mean(axis=0)
+        col_ok = col_ok & (col_chroma < 55.0)
+        if garbage_frac >= 0.05:
+            col_ok = col_ok & (col_chroma < 40.0)
+    cols = np.where(col_ok)[0]
+    if cols.size < 8:
+        x0, x1 = x0c, x1c
+    else:
+        x0, x1 = int(cols[0]), int(cols[-1]) + 1
+    return (
+        max(0, x0 - pad),
+        max(0, y0 - pad),
+        min(w, x1 + pad),
+        min(h, y1 + pad),
+    )
+
+
+def _largest_merged_run(indices: np.ndarray, max_gap: int = 6) -> tuple[int, int]:
+    """Return [start, end) of the largest run, merging gaps of at most max_gap rows."""
+    if indices.size < 1:
+        return 0, 0
+    runs: list[tuple[int, int]] = []
+    start = prev = int(indices[0])
+    for i in indices[1:]:
+        i = int(i)
+        if i - prev <= max_gap + 1:
+            prev = i
+        else:
+            runs.append((start, prev + 1))
+            start = prev = i
+    runs.append((start, prev + 1))
+    return max(runs, key=lambda r: r[1] - r[0])
+
+
+def is_monochrome_print(
+    img: Image.Image,
+    chroma_thr: int = 55,
+    min_on_frac: float = 0.02,
+    pca_thr: float = 0.985,
+) -> bool:
+    """True for B&W / sepia prints (nearly 1-D RGB among non-bed pixels)."""
+    rgb = np.asarray(img.convert("RGB"))
+    luma = rgb.mean(axis=2)
+    on = luma > 22
+    if float(on.mean()) < min_on_frac or int(on.sum()) < 1024:
+        return False
+    chroma = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+    on_chroma = chroma[on]
+    # Strong grey B&W.
+    if float(np.median(on_chroma)) <= 28 and float((on_chroma <= 28).mean()) >= 0.65:
+        return True
+    # Sepia / toned: RGB lies on a line (1 principal component).
+    X = rgb[on].astype(np.float64)
+    if len(X) > 40000:
+        rng = np.random.default_rng(0)
+        X = X[rng.choice(len(X), 40000, replace=False)]
+    X = X - X.mean(axis=0)
+    try:
+        _u, s, _vh = np.linalg.svd(X, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return False
+    ev = s * s
+    total = float(ev.sum())
+    if total <= 1e-6:
+        return False
+    return float(ev[0] / total) >= pca_thr and float(np.median(on_chroma)) <= chroma_thr
+
+
 def auto_crop(
     img: Image.Image,
     pad: int = 8,
@@ -330,18 +555,61 @@ def auto_crop(
     """Trim scanner void / black margins around the photo print.
 
     When faces are provided (or detected), prefers a face-seeded crop so tiny
-    prints on a large bed still get isolated and upscaled.
+    prints on a large bed still get isolated and upscaled. Monochrome / bordered
+    vintage prints skip face-zoom so the full mount (and matte) is kept.
+    Pass faces=[] (keep-border / --old-photos) to always keep the full mount
+    via mean-profile bbox — dense runs shave cream mattes off B&W prints.
     """
     rgb = np.asarray(img.convert("RGB"))
     gray = np.asarray(img.convert("L"))
     h, w = gray.shape
     chroma = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
 
-    face_list = list(faces) if faces is not None else detect_faces(img)
+    mono = is_monochrome_print(img)
+    # Face-seeded crops shave cream mattes off old B&W prints; keep the full mount.
+    if mono and faces is None:
+        face_list: list[tuple[int, int, int, int]] = []
+    else:
+        face_list = list(faces) if faces is not None else detect_faces(img)
+
+    # keep_white_border path passes faces=[] — use full-mount mean bbox so
+    # cream/white print borders aren't trimmed by dense "photo body" runs.
+    keep_mount = faces is not None and len(faces) == 0
+    if keep_mount or (mono and not face_list):
+        x0, y0, x1, y1 = mean_content_bbox(
+            gray, row_thr=float(thr), col_thr=float(thr), pad=pad, rgb=rgb
+        )
+        if x1 - x0 >= 32 and y1 - y0 >= 32:
+            cropped = img.crop((x0, y0, x1, y1))
+            g2 = np.asarray(cropped.convert("L"))
+            tx0, ty0, tx1, ty1 = trim_scanner_bed(g2, thr=max(thr + 4, 26), pad=1)
+            if (tx1 - tx0) >= 32 and (ty1 - ty0) >= 32:
+                cropped = cropped.crop((tx0, ty0, tx1, ty1))
+            return cropped
+
     x0, y0, x1, y1 = dense_content_bbox(gray, thr=None, pad=pad, chroma=chroma)
     area = (x1 - x0) * (y1 - y0)
     bed_area = w * h
-    dense_ok = area >= 32 * 32 and area <= 0.85 * bed_area
+    # Tiny bright islands on a large bed are usually noise/chroma, not the print.
+    dense_ok = area >= 32 * 32 and area <= 0.85 * bed_area and area >= 0.12 * bed_area
+    # If dense bbox is much smaller than a simple content bbox, prefer content
+    # (bright walls/sky must not win over the full print).
+    if dense_ok:
+        cx0, cy0, cx1, cy1 = mean_content_bbox(
+            gray, row_thr=float(thr), col_thr=float(thr), pad=0, rgb=rgb
+        )
+        c_area = max(1, (cx1 - cx0) * (cy1 - cy0))
+        if area < 0.5 * c_area:
+            dense_ok = False
+        else:
+            # Cream matte often sits outside the dense photo-body run — expand
+            # when mean extends and the extra strip is bright/low-chroma.
+            ring = _bright_matte_ring(gray, chroma, (x0, y0, x1, y1), (cx0, cy0, cx1, cy1))
+            if ring:
+                x0, y0, x1, y1 = cx0 - pad, cy0 - pad, cx1 + pad, cy1 + pad
+                x0, y0 = max(0, x0), max(0, y0)
+                x1, y1 = min(w, x1), min(h, y1)
+                area = (x1 - x0) * (y1 - y0)
 
     if face_list:
         fx0, fy0, fx1, fy1 = _face_union_box(face_list, w, h)
@@ -358,12 +626,9 @@ def auto_crop(
             dense_ok = (x1 - x0) >= 32 and (y1 - y0) >= 32
 
     if not dense_ok:
-        data = gray.tobytes()
-        x0, y0, x1, y1 = content_bbox(data, w, h, thr=thr)
-        x0 = max(0, x0 - pad)
-        y0 = max(0, y0 - pad)
-        x1 = min(w, x1 + pad)
-        y1 = min(h, y1 + pad)
+        x0, y0, x1, y1 = mean_content_bbox(
+            gray, row_thr=float(thr), col_thr=float(thr), pad=pad, rgb=rgb
+        )
 
     if x1 - x0 < 32 or y1 - y0 < 32:
         return img
@@ -377,11 +642,54 @@ def auto_crop(
     return cropped
 
 
-def auto_orient(img: Image.Image, prefer_landscape: bool = True) -> Image.Image:
-    """Orient using faces when possible; otherwise optional landscape preference.
+def _bright_matte_ring(
+    gray: np.ndarray,
+    chroma: np.ndarray,
+    dense: tuple[int, int, int, int],
+    mean: tuple[int, int, int, int],
+    luma_thr: float = 120.0,
+    chroma_thr: float = 45.0,
+    min_frac: float = 0.35,
+) -> bool:
+    """True when mean bbox extends past dense into a cream/white print border."""
+    dx0, dy0, dx1, dy1 = dense
+    mx0, my0, mx1, my1 = mean
+    if mx0 >= dx0 and my0 >= dy0 and mx1 <= dx1 and my1 <= dy1:
+        return False
+    if (mx1 - mx0) * (my1 - my0) <= (dx1 - dx0) * (dy1 - dy0):
+        return False
+    # Sample the strips that mean adds beyond dense (clamped to mean).
+    strips = []
+    if my0 < dy0:
+        strips.append((slice(my0, dy0), slice(mx0, mx1)))
+    if my1 > dy1:
+        strips.append((slice(dy1, my1), slice(mx0, mx1)))
+    if mx0 < dx0:
+        strips.append((slice(my0, my1), slice(mx0, dx0)))
+    if mx1 > dx1:
+        strips.append((slice(my0, my1), slice(dx1, mx1)))
+    if not strips:
+        return False
+    bright = 0
+    total = 0
+    for rs, cs in strips:
+        g = gray[rs, cs]
+        c = chroma[rs, cs]
+        if g.size < 8:
+            continue
+        total += int(g.size)
+        bright += int(((g >= luma_thr) & (c <= chroma_thr)).sum())
+    if total < 32:
+        return False
+    return (bright / total) >= min_frac
 
-    Portrait prints are no longer blindly rotated for the portal — that sideways'd
-    bordered snapshots. Prefer the rotation with the most upright faces.
+
+def auto_orient(img: Image.Image, prefer_landscape: bool = True) -> Image.Image:
+    """Orient using faces when possible; otherwise keep as-scanned.
+
+    Portrait prints must not be rotated solely to fill a landscape portal —
+    that sideways'd house/yard shots when YuNet emitted a false positive.
+    Landscape preference is only a tie-break among real face evidence.
     """
     w, h = img.size
     if max(w, h) < 64:
@@ -394,19 +702,31 @@ def auto_orient(img: Image.Image, prefer_landscape: bool = True) -> Image.Image:
 
     best = img
     best_score = (-1, -1, -1)
+    any_faces = False
 
     for im in candidates:
         faces = detect_faces(im)
         n = len(faces)
+        if n:
+            any_faces = True
         # Upright heads are typically taller than they are wide.
         tall = sum(1 for _x, _y, fw, fh in faces if fh >= fw * 0.95)
         iw, ih = im.size
-        land = 1 if (prefer_landscape and iw >= ih) else (1 if iw >= ih else 0)
+        land = 1 if iw >= ih else 0
         # Face count wins; then upright-ish boxes; then landscape preference.
         score = (n, tall, land if prefer_landscape else -land)
         if score > best_score:
             best_score = score
             best = im
+
+    if not any_faces:
+        return img
+    # Single YuNet hits are often false (costumes, shoulders, foliage).
+    # Need ≥2 upright face boxes before leaving as-scanned orientation.
+    if best is img:
+        return img
+    if best_score[1] < 2:
+        return img
     return best
 
 
@@ -437,9 +757,16 @@ def estimate_skew_angle(
     coarse: float = 0.5,
     fine: float = 0.1,
 ) -> float:
-    """Estimate small skew in degrees (positive = CCW) via edge projection search."""
+    """Estimate small skew in degrees (positive = CCW) via edge projection search.
+
+    Also consults interior Hough lines — damaged/torn borders can make the
+    full-frame projection score prefer 0° while the photo content is clearly tilted.
+    """
     if limit <= 0:
         return 0.0
+
+    hough_ang = _hough_content_skew(img, limit=limit)
+
     # Work on a modest preview for speed.
     preview = img.convert("L")
     max_side = 900
@@ -455,15 +782,23 @@ def estimate_skew_angle(
     gray = np.asarray(preview, dtype=np.float32)
     edges = _edge_map(gray)
     if edges.mean() < 1e-6:
-        return 0.0
+        return hough_ang
 
-    def best_in(angles: list[float]) -> tuple[float, float]:
+    # Mask out outer rim + torn lower third so jagged borders don't pin score at 0°.
+    eh, ew = edges.shape
+    interior = edges.copy()
+    interior[: int(0.08 * eh), :] = 0
+    interior[int(0.58 * eh) :, :] = 0
+    interior[:, : int(0.08 * ew)] = 0
+    interior[:, int(0.92 * ew) :] = 0
+
+    def best_in(edge_src: np.ndarray, angles: list[float]) -> tuple[float, float]:
         best_a, best_s = 0.0, -1.0
         for a in angles:
             if abs(a) < 1e-6:
-                sample = edges
+                sample = edge_src
             else:
-                rot = Image.fromarray((edges * 255).astype(np.uint8)).rotate(
+                rot = Image.fromarray((edge_src * 255).astype(np.uint8)).rotate(
                     a, resample=Image.Resampling.BILINEAR, fillcolor=0
                 )
                 sample = (np.asarray(rot) > 128).astype(np.float32)
@@ -473,18 +808,108 @@ def estimate_skew_angle(
         return best_a, best_s
 
     coarse_angles = [i * coarse for i in range(int(-limit / coarse), int(limit / coarse) + 1)]
-    a0, _ = best_in(coarse_angles)
+    a0, _ = best_in(edges, coarse_angles)
     fine_angles = [
         a0 + i * fine
         for i in range(int(-coarse / fine), int(coarse / fine) + 1)
         if abs(a0 + i * fine) <= limit + 1e-6
     ]
-    angle, _ = best_in(fine_angles or [a0])
+    angle, _ = best_in(edges, fine_angles or [a0])
+
+    # Interior-only search — wins when torn rims drown the full-frame score.
+    ai0, _ = best_in(interior, coarse_angles)
+    fine_i = [
+        ai0 + i * fine
+        for i in range(int(-coarse / fine), int(coarse / fine) + 1)
+        if abs(ai0 + i * fine) <= limit + 1e-6
+    ]
+    angle_i, _ = best_in(interior, fine_i or [ai0])
 
     # Ignore tiny jitter.
     if abs(angle) < 0.15:
+        angle = 0.0
+    else:
+        angle = round(angle, 2)
+    if abs(angle_i) < 0.15:
+        angle_i = 0.0
+    else:
+        angle_i = round(angle_i, 2)
+
+    # Prefer interior projection when full-frame latches near 0° but content tilts.
+    if abs(angle) < 0.5 and abs(angle_i) >= 0.75:
+        angle = angle_i
+    elif abs(angle_i) >= 0.75 and abs(angle_i) > abs(angle) + 0.5:
+        # Stronger interior signal (e.g. building fascia) beats a weak border vote.
+        angle = angle_i
+
+    # Prefer clear interior-line tilt when projection still disagrees / is weak.
+    if abs(hough_ang) >= 0.75 and (abs(angle) < 0.5 or abs(hough_ang) > abs(angle) + 0.75):
+        return round(hough_ang, 2)
+    return angle
+
+
+def _hough_content_skew(img: Image.Image, limit: float = 8.0) -> float:
+    """Skew from long near-horizontal lines in the print interior (PIL CCW degrees).
+
+    A content line at +θ° (down to the right, y-down coords) is leveled by rotating
+    the image CCW by +θ — same sign as the measured line angle.
+    """
+    if not _HAS_CV2 or limit <= 0:
         return 0.0
-    return round(angle, 2)
+    gray = np.asarray(img.convert("L"))
+    h, w = gray.shape
+    if min(h, w) < 64:
+        return 0.0
+    # Exclude outer border / torn edges that dominate projection scores.
+    x0, x1 = int(0.12 * w), int(0.88 * w)
+    y0, y1 = int(0.12 * h), int(0.72 * h)
+    if x1 - x0 < 64 or y1 - y0 < 64:
+        return 0.0
+    roi = gray[y0:y1, x0:x1]
+    edges = cv2.Canny(roi, 50, 150)
+    min_len = max(40, (x1 - x0) // 6)
+    lines = cv2.HoughLinesP(
+        edges, 1, np.pi / 180, threshold=60, minLineLength=min_len, maxLineGap=16
+    )
+    if lines is None or len(lines) < 3:
+        return 0.0
+    pairs: list[tuple[float, float]] = []
+    for ln in lines:
+        x1a, y1a, x2a, y2a = (int(v) for v in ln.reshape(4))
+        dx, dy = x2a - x1a, y2a - y1a
+        length = float(np.hypot(dx, dy))
+        if length < 40:
+            continue
+        ang = float(np.degrees(np.arctan2(dy, dx)))
+        if ang > 90:
+            ang -= 180
+        if ang < -90:
+            ang += 180
+        if abs(ang) <= min(25.0, limit + 5):
+            pairs.append((ang, length))
+    if len(pairs) < 3:
+        return 0.0
+    pairs.sort(key=lambda t: -t[1])
+    pairs = pairs[:40]
+    # Axis-aligned AABB / bed edges often inject strong 0° lines that drown out
+    # a real 2–4° content tilt — prefer the non-level cluster when it is strong.
+    tilted = [(a, l) for a, l in pairs if abs(a) >= 0.75]
+    use = tilted if sum(l for _a, l in tilted) >= 0.30 * sum(l for _a, l in pairs) and len(tilted) >= 3 else pairs
+    angs = np.array([a for a, _l in use], dtype=np.float64)
+    lens = np.array([l for _a, l in use], dtype=np.float64)
+    # Heaviest tight cluster (not a diluted median across opposing tilts).
+    best_w, best_c = 0.0, 0.0
+    for seed in angs:
+        m = np.abs(angs - seed) <= 0.75
+        wsum = float(lens[m].sum())
+        if wsum > best_w:
+            best_w = wsum
+            best_c = float(np.average(angs[m], weights=lens[m]))
+    # Same sign as line angle: +θ down-right → rotate(+θ) CCW to level.
+    corr = best_c
+    if abs(corr) < 0.35 or abs(corr) > limit:
+        return 0.0
+    return float(np.clip(corr, -limit, limit))
 
 
 def deskew(
@@ -496,9 +921,15 @@ def deskew(
     angle = estimate_skew_angle(img, limit=limit)
     if abs(angle) < 0.15:
         return img, 0.0
-    # PIL rotate is CCW for positive angles; expand then re-crop void.
+    # PIL rotate is CCW for positive angles; expand then peel only the void.
+    # Do NOT run full auto_crop here — dense-bbox can latch onto a bright
+    # corner after rotation and zoom-crop most of the print away.
     rotated = img.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=fill)
-    return auto_crop(rotated, pad=4, thr=18), angle
+    gray = np.asarray(rotated.convert("L"))
+    x0, y0, x1, y1 = trim_scanner_bed(gray, thr=22, dark_frac=0.85, mean_cap=10.0, strip=1, pad=2)
+    if (x1 - x0) >= 32 and (y1 - y0) >= 32:
+        rotated = rotated.crop((x0, y0, x1, y1))
+    return rotated, angle
 
 
 def enhance_old_photo(img: Image.Image, strength: float = 1.0) -> Image.Image:
@@ -1331,14 +1762,15 @@ def has_white_border(
     band_frac: float = 0.07,
     min_band_px: int = 5,
     max_band_frac: float = 0.22,
-    luma_thr: int = 155,
-    chroma_thr: int = 32,
+    luma_thr: int = 130,
+    chroma_thr: int = 40,
     min_sides: int = 3,
 ) -> bool:
     """Detect classic white/cream print borders on most sides of the print.
 
     Measures bands relative to the print's own non-black bounds so a tilted
-    print with scanner void in the AABB corners still counts.
+    print with scanner void in the AABB corners still counts. Thresholds allow
+    aged cream/sepia mattes, not only paper-white.
     """
     rgb = np.asarray(img.convert("RGB"))
     h, w = rgb.shape[:2]
@@ -1380,7 +1812,8 @@ def has_white_border(
         bright = usable & (strip_luma >= luma_thr) & (strip_chroma <= chroma_thr)
         frac = float(bright[usable].mean()) if usable.any() else 0.0
         med = float(np.median(strip_luma[usable])) if usable.any() else 0.0
-        return frac >= 0.50 and med >= luma_thr - 10 and med >= inner_med + 15
+        # Aged cream mattes: brighter than the photo body, not necessarily >155.
+        return frac >= 0.40 and med >= min(luma_thr - 15, inner_med + 12) and med >= inner_med + 10
 
     sides = (
         side_is_border(pl[:band_y, :], pc[:band_y, :]),
@@ -1404,9 +1837,9 @@ def fit_to_portal(
     """Place img into a fixed portal.
 
     Returns (frame, cropped_for_aspect, info).
-    If keep_white_border is True (default) and a classic white print border is
-    detected, skip aspect cropping and letterbox-upscale to preserve AR + border.
-    Pass False to always allow --crop-to-portal; None treats as True.
+    When keep_white_border is True (default for --old-photos), never aspect-crop
+    to the portal — letterbox/pillarbox and upscale so the full print stays
+    visible and centered. Pass False (--no-keep-border) to allow crop-to-portal.
     """
     pw, ph = portal
     cropped = False
@@ -1427,7 +1860,14 @@ def fit_to_portal(
 
     border = has_white_border(img)
     info["white_border"] = border
-    preserve = bool(keep_white_border) and border
+    mono = is_monochrome_print(img)
+    info["monochrome"] = mono
+    src_ar = img.size[0] / max(1, img.size[1])
+    portal_ar = pw / max(1, ph)
+    ar_mismatch = abs(src_ar - portal_ar) / portal_ar > crop_threshold
+    info["ar_mismatch"] = ar_mismatch
+    # --old-photos / keep_white_border: always preserve native AR (no portal crop).
+    preserve = bool(keep_white_border)
 
     need_anchors = face_aware and (crop_to_portal or mode == "cover") and not preserve
     if need_anchors:
@@ -1436,9 +1876,9 @@ def fit_to_portal(
         info["used"] = bool(anchors)
         info["anchor"] = kind
 
-    if preserve and (crop_to_portal or mode == "cover"):
-        # Drop scanner-void corners around a tilted bordered print, then
-        # upscale to fit portal while keeping native AR + decorative border.
+    if preserve:
+        # Drop scanner-void corners around a tilted print, then upscale into the
+        # portal with contain (centered matte) — never cover-crop.
         luma = np.asarray(img.convert("L"))
         on = np.asarray(luma) > 22
         ys, xs = np.where(on)
@@ -1451,12 +1891,19 @@ def fit_to_portal(
         info["kept_aspect"] = True
         crop_to_portal = False
     elif crop_to_portal and pw > 0 and ph > 0:
-        img, cropped, kept, anchors = crop_to_aspect(
-            img, pw / ph, threshold=crop_threshold, faces=anchors if face_aware else None
-        )
-        info["kept"] = kept
-        if cropped or abs((img.size[0] / max(1, img.size[1])) - (pw / ph)) <= crop_threshold:
-            mode = "cover"
+        # If forcing portal AR would discard most of the print (typical for a
+        # portrait photo into a 16:9 portal), letterbox instead of zoom-cropping.
+        kept_frac = (portal_ar / src_ar) if src_ar > portal_ar else (src_ar / portal_ar)
+        if kept_frac < 0.55:
+            mode = "contain"
+            info["kept_aspect"] = True
+        else:
+            img, cropped, kept, anchors = crop_to_aspect(
+                img, portal_ar, threshold=crop_threshold, faces=anchors if face_aware else None
+            )
+            info["kept"] = kept
+            if cropped or abs((img.size[0] / max(1, img.size[1])) - portal_ar) <= crop_threshold:
+                mode = "cover"
 
     canvas = Image.new("RGB", (pw, ph), matte)
     w, h = img.size
@@ -1486,12 +1933,20 @@ def fit_to_portal(
             x0 = max(0, (nw - pw) // 2)
             y0 = max(0, (nh - ph) // 2)
         frame = resized.crop((x0, y0, x0 + pw, y0 + ph))
-        # Peel residual bed hairlines only (low-mean strips), then refill portal.
+        # Peel residual bed hairlines, then refill with uniform cover (never
+        # stretch X/Y independently — that caused horizontal squash artifacts).
         fg = np.asarray(frame.convert("L"))
         fx0, fy0, fx1, fy1 = trim_scanner_bed(fg, thr=32, dark_frac=0.80, mean_cap=12.0, strip=1, pad=0)
         peeled_w, peeled_h = fx1 - fx0, fy1 - fy0
         if (fx0, fy0, fx1, fy1) != (0, 0, pw, ph) and peeled_w >= int(pw * 0.92) and peeled_h >= int(ph * 0.92):
-            frame = upscale_image(frame.crop((fx0, fy0, fx1, fy1)), (pw, ph), sharpen=0.0)
+            peeled = frame.crop((fx0, fy0, fx1, fy1))
+            cover = max(pw / peeled_w, ph / peeled_h)
+            rw = max(1, int(round(peeled_w * cover)))
+            rh = max(1, int(round(peeled_h * cover)))
+            filled = upscale_image(peeled, (rw, rh), sharpen=0.0)
+            ox = max(0, (rw - pw) // 2)
+            oy = max(0, (rh - ph) // 2)
+            frame = filled.crop((ox, oy, ox + pw, oy + ph))
         return frame, cropped, info
 
     x = (pw - nw) // 2
@@ -1501,17 +1956,36 @@ def fit_to_portal(
 
 
 def next_index(out_dir: Path) -> int:
-    existing = sorted(out_dir.glob("photo_*.jpg")) + sorted(out_dir.glob("photo_*.jpeg"))
+    """Next photo_NNNN index (1–9999). Accepts existing 3- or 4-digit names."""
+    existing = (
+        sorted(out_dir.glob("photo_*.jpg"))
+        + sorted(out_dir.glob("photo_*.jpeg"))
+        + sorted(out_dir.glob("photo_*.raw"))
+    )
     if not existing:
         return 1
     nums = []
     for p in existing:
-        stem = p.stem  # photo_001
+        stem = p.stem  # photo_0001
         try:
             nums.append(int(stem.split("_")[-1]))
         except ValueError:
             continue
     return (max(nums) + 1) if nums else 1
+
+
+def photo_stem(idx: int) -> str:
+    """Format album basename as photo_NNNN (zero-padded to 4 digits)."""
+    if not 1 <= idx <= 9999:
+        raise ValueError(f"photo index out of range 1–9999: {idx}")
+    return f"photo_{idx:04d}"
+
+
+def scan_garbage_fraction(img: Image.Image) -> float:
+    """Fraction of rows that look like USB buffer rainbow (high chroma)."""
+    rgb = np.asarray(img.convert("RGB"))
+    chroma = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+    return float((chroma.mean(axis=1) > 80.0).mean())
 
 
 def process_raw(
@@ -1530,8 +2004,15 @@ def process_raw(
     keep_white_border: bool = True,
     smooth_grid: bool = DEFAULT_SMOOTH_GRID,
 ) -> tuple[int, int, float, bool, dict]:
-    img = raw_to_rgb_image(raw, y_scale=y_scale)
-    img = auto_crop(img)
+    auto_y = isinstance(y_scale, str) and str(y_scale).lower() in ("auto", "a")
+    y_num = resolve_yscale(raw, y_scale)
+    if auto_y and face_aware:
+        y_num = refine_yscale_with_faces(raw, y_num)
+    img = raw_to_rgb_image(raw, y_scale=y_num)
+    garbage_frac = scan_garbage_fraction(img)
+    # Keep full mounts for vintage / bordered work — face-seeded crops shave
+    # cream mattes and group edges off old B&W prints.
+    img = auto_crop(img, faces=[] if keep_white_border else None)
     # Deskew while the print still has detectable borders, before 90° orient.
     img, skew = deskew(img, limit=deskew_limit, fill=(0, 0, 0))
     # Peel black corners introduced by rotation fill.
@@ -1565,31 +2046,47 @@ def process_raw(
         keep_white_border=keep_white_border,
     )
     face_info["grid"] = grid_info
+    face_info["garbage_frac"] = round(garbage_frac, 3)
+    face_info["yscale"] = y_num
     out_path.parent.mkdir(parents=True, exist_ok=True)
     frame.save(out_path, "JPEG", quality=92, optimize=True, progressive=True)
     return frame.size[0], frame.size[1], skew, ar_cropped, face_info
 
 
-def scan_one(bot: Bot, verbose: bool = False) -> bytes:
+def scan_one(bot: Bot, verbose: bool = False, previous_raw: bytes | None = None) -> bytes:
+    # After the first page, snapshot progress so read_image can reject a stale
+    # ready latch and avoid re-saving the same raw.
+    prior = None
+    if previous_raw is not None:
+        _ready, _offset, prior = read_progress(bot)
     prepare_scan(bot)
-    raw = read_image(bot, total_bytes=EXPECTED_IMAGE_BYTES, start_offset=None)
+    raw = read_image(
+        bot,
+        total_bytes=EXPECTED_IMAGE_BYTES,
+        start_offset=None,
+        prior_progress=prior,
+    )
     stop_scan(bot)
+    if previous_raw is not None and raw == previous_raw:
+        raise RuntimeError(
+            "scanner returned the same buffer as the previous scan — "
+            "load a new photo before the next capture"
+        )
     return raw
 
 
 def apply_old_photo_preset(args: argparse.Namespace) -> argparse.Namespace:
     """Apply recommended vintage-print settings without clobbering explicit flags."""
     preset = OLD_PHOTO_PRESET
-    # Enable portal fill + face framing; white-border logic still overrides crop when needed.
-    args.crop_to_portal = True
+    # Letterbox into the portal — never aspect-crop old mounts.
+    args.crop_to_portal = False
+    args.fit = "contain"
     if args.enhance == 1.0:
         args.enhance = float(preset["enhance"])
     if args.portal == "1920x1080":
         args.portal = str(preset["portal"])
     if args.matte == "28,26,24":
         args.matte = str(preset["matte"])
-    if args.fit == "contain":
-        args.fit = str(preset["fit"])
     if args.yscale == "auto":
         args.yscale = str(preset["yscale"])
     if args.rotate == "auto":
@@ -1610,8 +2107,9 @@ def main() -> int:
         epilog="""
 recommended for old photos:
   %(prog)s --old-photos --out ~/Pictures/album
-      crop-to-portal + face-aware framing, keep white-border AR, auto deskew,
-      gentle contrast/color lift (enhance 1.15), 1080p portal @ 2× density,
+      contain/letterbox into portal (no aspect-crop), keep full mount + border,
+      auto deskew, gentle contrast/color lift (enhance 1.15), 1080p @ 2× density,
+      auto y-scale (face-refined when squashed)
       charcoal matte
 
   useful tweaks:
@@ -1663,7 +2161,7 @@ recommended for old photos:
     ap.add_argument(
         "--no-keep-border",
         action="store_true",
-        help="allow aspect-crop even when a classic white print border is detected",
+        help="allow aspect-crop to portal even on bordered / AR-mismatched vintage prints",
     )
     ap.add_argument("--yscale", default="auto", help="auto or numeric scale")
     ap.add_argument("--enhance", type=float, default=1.0, help="0=off, 1=default lift for old prints")
@@ -1682,9 +2180,9 @@ recommended for old photos:
         action="store_true",
         help="soften scanner/paper grid lines (Radon + spatial morph; off unless set)",
     )
-    ap.add_argument("--count", type=int, default=0, help="scan N photos then stop (0=interactive)")
+    ap.add_argument("--count", type=int, default=0, help="stop after N photos (0=unlimited; still prompts between sheets)")
     ap.add_argument("--from-raw", action="append", default=[], help="process existing .raw (repeatable)")
-    ap.add_argument("--start", type=int, default=0, help="starting photo_NNN index (0=auto)")
+    ap.add_argument("--start", type=int, default=0, help="starting photo_NNNN index 1–9999 (0=auto)")
     ap.add_argument("--scan", action="store_true", help="enter live scan mode after --from-raw")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -1699,6 +2197,9 @@ recommended for old photos:
     matte = parse_rgb(args.matte)
     deskew_limit = 0.0 if args.no_deskew else float(args.deskew)
     idx = args.start if args.start > 0 else next_index(out_dir)
+    if idx > 9999:
+        print("album full (photo_9999 already used)", file=sys.stderr)
+        return 1
 
     face_aware = not args.no_face_crop
     keep_border = not args.no_keep_border
@@ -1735,9 +2236,12 @@ recommended for old photos:
         if abs(skew) >= 0.15:
             notes.append(f"deskew {skew:+.2f}°")
         if face_info.get("kept_aspect"):
-            notes.append("kept white-border AR")
+            notes.append("letterboxed")
         elif ar_cropped:
             notes.append("aspect-cropped")
+        gf = float(face_info.get("garbage_frac") or 0.0)
+        if gf >= 0.05:
+            notes.append(f"WARN corrupt-tail {gf:.0%} — consider rescan")
         if face_info.get("used") and (ar_cropped or args.fit == "cover"):
             kind = face_info.get("anchor") or "faces"
             notes.append(f"{kind} {face_info['kept']}/{face_info['detected']}")
@@ -1755,16 +2259,58 @@ recommended for old photos:
     scanned = 0
     for raw_path in args.from_raw:
         p = Path(raw_path).expanduser()
+        t0 = time.time()
         raw = p.read_bytes()
-        dest = out_dir / f"photo_{idx:03d}.jpg"
-        print(f"wrote {_process(raw, dest)} from {p.name}")
+        dest = out_dir / f"{photo_stem(idx)}.jpg"
+        label = _process(raw, dest)
+        dt = time.time() - t0
+        print(f"wrote {label} from {p.name} in {dt:.1f}s")
         idx += 1
+        if idx > 9999:
+            print("album full (photo_9999); stopping", file=sys.stderr)
+            break
         scanned += 1
 
     live = args.scan or args.count > 0 or (not args.from_raw)
     if not live:
         print(f"done — {scanned} frame(s) in {out_dir}")
         return 0
+
+    # Background JPG pipeline: scan thread enqueues raws; worker writes .raw+.jpg.
+    # maxsize limits RAM if processing falls behind (~15MB per queued page).
+    job_q: queue.Queue = queue.Queue(maxsize=2)
+    log_lock = threading.Lock()
+    worker_errors: list[BaseException] = []
+
+    def _log(msg: str) -> None:
+        with log_lock:
+            print(msg, flush=True)
+
+    def _jpg_worker() -> None:
+        while True:
+            item = job_q.get()
+            try:
+                if item is None:
+                    return
+                raw_bytes, dest, raw_out, t_scan, t_enqueue = item
+                t1 = time.time()
+                try:
+                    raw_out.write_bytes(raw_bytes)
+                    label = _process(raw_bytes, dest)
+                    t_jpg = time.time() - t1
+                    t_total = time.time() - t_enqueue
+                    _log(
+                        f"wrote {label} — scan {t_scan:.1f}s, jpg {t_jpg:.1f}s, "
+                        f"total {t_total:.1f}s"
+                    )
+                except BaseException as exc:  # noqa: BLE001 — surface in main
+                    worker_errors.append(exc)
+                    _log(f"jpg failed for {dest.name}: {exc}")
+            finally:
+                job_q.task_done()
+
+    worker = threading.Thread(target=_jpg_worker, name="jpg-worker", daemon=True)
+    worker.start()
 
     bot = Bot(verbose=args.verbose)
     try:
@@ -1773,36 +2319,64 @@ recommended for old photos:
             print("no status response; is the PS100 plugged in?", file=sys.stderr)
             return 1
         print(f"status: {data!r} ({hx(data)})")
+        print("jpg processing runs in background — you can load the next print while it finishes")
 
         live_count = 0
+        previous_raw: bytes | None = None
         while True:
             if args.count and live_count >= args.count:
                 break
-            if not args.count:
-                try:
-                    reply = input("Load a photo, then Enter to scan (q=quit): ").strip().lower()
-                except EOFError:
-                    break
-                if reply in ("q", "quit", "exit"):
-                    break
+            # Always wait for a sheet: --count only caps how many scans, it does
+            # not fire back-to-back reads of the same buffer.
+            pending = job_q.unfinished_tasks
+            label = "Load a photo, then Enter to scan"
+            if args.count:
+                label = f"Load photo {live_count + 1}/{args.count}, then Enter"
+            if pending:
+                label += f" [{pending} jpg pending]"
+            try:
+                reply = input(f"{label} (q=quit): ").strip().lower()
+            except EOFError:
+                break
+            if reply in ("q", "quit", "exit"):
+                break
 
-            print("scanning…")
+            print("scanning…", flush=True)
             t0 = time.time()
             try:
-                raw = scan_one(bot, verbose=args.verbose)
+                raw = scan_one(bot, verbose=args.verbose, previous_raw=previous_raw)
             except Exception as exc:
                 print(f"scan failed: {exc}", file=sys.stderr)
                 continue
-            dest = out_dir / f"photo_{idx:03d}.jpg"
-            raw_path = out_dir / f"photo_{idx:03d}.raw"
-            raw_path.write_bytes(raw)
-            print(f"wrote {_process(raw, dest)} in {time.time() - t0:.1f}s")
+            t_scan = time.time() - t0
+
+            dest = out_dir / f"{photo_stem(idx)}.jpg"
+            raw_path = out_dir / f"{photo_stem(idx)}.raw"
+            # May block briefly if the worker is still catching up (queue full).
+            job_q.put((raw, dest, raw_path, t_scan, t0))
+            _log(f"queued {dest.name} (scan {t_scan:.1f}s) — processing in background…")
+            previous_raw = raw
             idx += 1
+            if idx > 9999:
+                print("album full (photo_9999); quitting", file=sys.stderr)
+                break
             live_count += 1
             scanned += 1
     finally:
         bot.close()
+        # Drain pending JPG jobs before exit.
+        if job_q.unfinished_tasks:
+            print(
+                f"finishing {job_q.unfinished_tasks} background jpg job(s)…",
+                flush=True,
+            )
+        job_q.put(None)
+        job_q.join()
+        worker.join(timeout=600)
 
+    if worker_errors:
+        print(f"done — {scanned} frame(s) in {out_dir} ({len(worker_errors)} jpg error(s))", flush=True)
+        return 1
     print(f"done — {scanned} frame(s) in {out_dir}")
     return 0
 
