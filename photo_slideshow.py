@@ -173,7 +173,15 @@ def refine_yscale_with_faces(raw: bytes, base: float, width: int = PARAM_WIDTH) 
         faces = detect_faces(img)
         if not faces:
             return 0.0, 0
-        ratios = [fh / max(1, fw) for _x, _y, fw, fh in faces if fh >= fw * 0.85]
+        # Ignore smear-damaged / outlier boxes — vertically melted faces (photo 97)
+        # pull mean h/w high and lock auto y_scale on a too-short valley.
+        ratios = [
+            fh / max(1, fw)
+            for _x, _y, fw, fh in faces
+            if fw < 0.45 * img.size[0] and 0.90 <= fh / max(1, fw) <= 1.45
+        ]
+        if not ratios:
+            ratios = [fh / max(1, fw) for _x, _y, fw, fh in faces if fh >= fw * 0.85]
         if not ratios:
             ratios = [fh / max(1, fw) for _x, _y, fw, fh in faces]
         return float(np.mean(ratios)), len(ratios)
@@ -462,14 +470,27 @@ def mean_content_bbox(
     if rows.size < 8:
         return 0, 0, w, h
 
+    full_y0, full_y1 = int(rows[0]), int(rows[-1]) + 1
+    # Merge small gaps (dark mid-print bands) but not a distant bed sliver.
+    island_y0, island_y1 = _largest_merged_run(rows, max_gap=max(8, int(0.03 * h)))
     if garbage_frac >= 0.05:
         # Corrupt tail: largest near-contiguous island above the rainbow.
-        y0, y1 = _largest_merged_run(rows, max_gap=max(8, int(0.03 * h)))
+        y0, y1 = island_y0, island_y1
         if y1 - y0 < 8:
-            y0, y1 = int(rows[0]), int(rows[-1]) + 1
+            y0, y1 = full_y0, full_y1
     else:
-        # Clean scan: keep the full mount (cream borders + dark mid bands).
-        y0, y1 = int(rows[0]), int(rows[-1]) + 1
+        # Clean scan: keep the full mount, but drop a thin distant island
+        # (photo 105: white bed hairline far below the print).
+        full_h = full_y1 - full_y0
+        island_h = island_y1 - island_y0
+        if (
+            island_h >= 32
+            and full_h - island_h > max(40, int(0.08 * h))
+            and island_h < 0.85 * full_h
+        ):
+            y0, y1 = island_y0, island_y1
+        else:
+            y0, y1 = full_y0, full_y1
 
     # Refine X on the kept Y band.
     band_y = work[y0:y1]
@@ -751,6 +772,59 @@ def _projection_score(edges: np.ndarray) -> float:
     return float(row.var() + 0.35 * col.var())
 
 
+def _print_outline_skew(img: Image.Image, limit: float = 8.0) -> float | None:
+    """Skew of the print's outer rectangle via min-area rect (PIL CCW degrees).
+
+    Returns None when no reliable rectangle is found. A near-zero return means
+    the paper is already level — callers must not fall through to content Hough
+    / projection (shorelines and fences often invent a large false tilt).
+    """
+    if not _HAS_CV2 or limit <= 0:
+        return None
+    gray = np.asarray(img.convert("L"))
+    h, w = gray.shape
+    if min(h, w) < 64:
+        return None
+    mask = (gray > 30).astype(np.uint8) * 255
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    area = float(cv2.contourArea(c))
+    if area < 0.20 * h * w:
+        return None
+    box = cv2.boxPoints(cv2.minAreaRect(c)).astype(np.float32)
+    # Longest opposing edges → paper long-side tilt.
+    edges: list[tuple[float, float]] = []
+    for i in range(4):
+        p1, p2 = box[i], box[(i + 1) % 4]
+        d = p2 - p1
+        length = float(np.hypot(d[0], d[1]))
+        ang = float(np.degrees(np.arctan2(d[1], d[0])))
+        if ang > 90:
+            ang -= 180
+        if ang < -90:
+            ang += 180
+        edges.append((length, ang))
+    edges.sort(key=lambda t: -t[0])
+    long_angs: list[float] = []
+    for _length, ang in edges[:2]:
+        if ang > 45:
+            ang -= 90
+        elif ang < -45:
+            ang += 90
+        long_angs.append(ang)
+    if not long_angs:
+        return None
+    mean = float(np.mean(long_angs))
+    # Same sign as line tilt: +θ down-right → rotate(+θ) CCW to level.
+    if abs(mean) > limit:
+        return None
+    if abs(mean) < 0.20:
+        return 0.0
+    return float(np.clip(mean, -limit, limit))
+
+
 def estimate_skew_angle(
     img: Image.Image,
     limit: float = DEFAULT_DESKEW_LIMIT,
@@ -761,10 +835,13 @@ def estimate_skew_angle(
 
     Also consults interior Hough lines — damaged/torn borders can make the
     full-frame projection score prefer 0° while the photo content is clearly tilted.
+    When the print outline is a clear rectangle, prefer that over content Hough
+    (shorelines/trees falsely deskew leveled bordered prints).
     """
     if limit <= 0:
         return 0.0
 
+    outline_ang = _print_outline_skew(img, limit=limit)  # None = unreliable
     hough_ang = _hough_content_skew(img, limit=limit)
 
     # Work on a modest preview for speed.
@@ -842,7 +919,16 @@ def estimate_skew_angle(
         # Stronger interior signal (e.g. building fascia) beats a weak border vote.
         angle = angle_i
 
-    # Prefer clear interior-line tilt when projection still disagrees / is weak.
+    # Prefer clear interior-line tilt when projection still disagrees / is weak —
+    # but not when the paper outline is already near-level (false Hough/projection
+    # from water, fences, branches) or when outline and Hough strongly disagree.
+    if outline_ang is not None:
+        # Reliable rectangle: outline wins; near-zero means leave the print alone.
+        if abs(outline_ang) < 0.35:
+            return 0.0
+        if abs(hough_ang) < 0.35 or abs(hough_ang - outline_ang) > 1.5:
+            return round(outline_ang, 2)
+        return round(0.65 * outline_ang + 0.35 * hough_ang, 2)
     if abs(hough_ang) >= 0.75 and (abs(angle) < 0.5 or abs(hough_ang) > abs(angle) + 0.75):
         return round(hough_ang, 2)
     return angle
